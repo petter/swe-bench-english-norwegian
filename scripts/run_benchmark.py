@@ -412,15 +412,19 @@ Please:
                                 event = json.loads(line)
                                 json_events.append(event)
                                 
-                                # Track token usage from events in real-time
-                                if event.get("type") == "usage":
-                                    tokens = event.get("totalTokens") or event.get("tokens")
-                                    if tokens:
-                                        status.tokens_used = tokens
-                                elif event.get("type") == "token_usage":
-                                    tokens = event.get("total") or event.get("count")
-                                    if tokens:
-                                        status.tokens_used = tokens
+                                # Track token usage from step_finish events
+                                if event.get("type") == "step_finish":
+                                    part = event.get("part", {})
+                                    tokens_data = part.get("tokens", {})
+                                    if tokens_data:
+                                        # Sum up input, output, and cache read tokens
+                                        input_tokens = tokens_data.get("input", 0)
+                                        output_tokens = tokens_data.get("output", 0)
+                                        cache_read = tokens_data.get("cache", {}).get("read", 0)
+                                        
+                                        # Update cumulative token count
+                                        step_total = input_tokens + output_tokens + cache_read
+                                        status.tokens_used += step_total
                             except json.JSONDecodeError:
                                 # Not JSON, skip
                                 pass
@@ -443,6 +447,21 @@ Please:
             result_data["stderr"] = "\n".join(stderr_lines) if stderr_lines else ""
             result_data["success"] = process.returncode == 0
             result_data["json_events"] = json_events
+            
+            # Calculate final token count from all step_finish events
+            # (in case we missed any during streaming)
+            total_tokens = 0
+            for event in json_events:
+                if event.get("type") == "step_finish":
+                    part = event.get("part", {})
+                    tokens_data = part.get("tokens", {})
+                    if tokens_data:
+                        input_tokens = tokens_data.get("input", 0)
+                        output_tokens = tokens_data.get("output", 0)
+                        cache_read = tokens_data.get("cache", {}).get("read", 0)
+                        total_tokens += input_tokens + output_tokens + cache_read
+            
+            status.tokens_used = total_tokens
             result_data["tokens_used"] = status.tokens_used
             
             # Evaluate the solution if OpenCode completed successfully
