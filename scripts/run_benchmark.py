@@ -212,6 +212,9 @@ def ensure_repository(repo_slug: str, root: Path, instance_id: str) -> Path:
             raise RuntimeError(
                 f"Existing directory {target_dir} is not a git repository."
             )
+        # Clean up any dirty state before fetching
+        run_git_command(["reset", "--hard"], cwd=target_dir, quiet=True)
+        run_git_command(["clean", "-fdx"], cwd=target_dir, quiet=True)
         run_git_command(["fetch", "--all", "--tags", "--prune"], cwd=target_dir, quiet=True)
     else:
         repo_url = f"https://github.com/{repo_slug}.git"
