@@ -135,12 +135,23 @@ class ProgressTracker:
         
         with self.lock:
             for idx, entry in enumerate(self.entries, start=1):
+                # Format model name for display (show only last part after :)
+                model_display = "-"
+                if entry.model:
+                    # Extract just the model name after : if present
+                    model_parts = entry.model.split(":")
+                    model_name = model_parts[-1] if len(model_parts) > 1 else entry.model
+                    # Further shorten if needed (e.g., "anthropic/claude-sonnet-4.5" -> "claude-sonnet-4.5")
+                    if "/" in model_name:
+                        model_name = model_name.split("/")[-1]
+                    model_display = model_name[:12]
+                
                 table.add_row(
                     str(idx),
                     f"{entry.status_icon} {entry.status}",
                     entry.instance_id[:25],  # Truncate long IDs
                     entry.repo.split("/")[-1][:16],  # Show just repo name, truncated
-                    entry.model[:12] if entry.model else "-",
+                    model_display,
                     str(entry.tokens_used) if entry.tokens_used > 0 else "-",
                     entry.elapsed_time,
                     entry.eval_status,
@@ -234,8 +245,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--opencode-model",
-        default=None,
-        help="Specific OpenCode model to use (e.g., anthropic/claude-sonnet-4). If not specified, uses OpenCode's default.",
+        default="copilot:anthropic/claude-sonnet-4.5",
+        help="Specific OpenCode model to use (default: copilot:anthropic/claude-sonnet-4.5).",
     )
     return parser.parse_args()
 
@@ -399,8 +410,6 @@ Please:
             if opencode_model:
                 cmd.extend(["--model", opencode_model])
                 status.model = opencode_model
-            else:
-                status.model = "default"
             cmd.append(prompt)
             
             # Run opencode with Popen to stream output line by line
