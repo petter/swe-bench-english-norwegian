@@ -42,7 +42,7 @@ class EntryStatus:
     def __init__(self, instance_id: str, repo: str):
         self.instance_id = instance_id
         self.repo = repo
-        self.status = "pending"  # pending, cloning, running, evaluating, completed, failed
+        self.status = "pending"  # pending, cloning, running, evaluating, done, failed
         self.tokens_used = 0
         self.model: str | None = None
         self.start_time: datetime | None = None
@@ -65,12 +65,23 @@ class EntryStatus:
     @property
     def status_icon(self) -> str:
         """Get status icon for display."""
+        # For done status, show icon based on evaluation result
+        if self.status == "done":
+            if self.evaluation and self.evaluation.success:
+                return "✅"
+            elif self.evaluation and self.evaluation.resolved and not self.evaluation.maintained:
+                return "⚠️"
+            elif self.evaluation:
+                return "❌"
+            else:
+                return "✓"  # Done but not evaluated yet (shouldn't happen)
+        
+        # For other statuses, use standard icons
         icons = {
             "pending": "⏳",
             "cloning": "📥",
             "running": "🔄",
             "evaluating": "🧪",
-            "completed": "✅",
             "failed": "❌",
         }
         return icons.get(self.status, "❓")
@@ -159,7 +170,7 @@ class ProgressTracker:
                 
             # Add summary row
             total_tokens = sum(e.tokens_used for e in self.entries)
-            completed = sum(1 for e in self.entries if e.status == "completed")
+            done = sum(1 for e in self.entries if e.status == "done")
             failed = sum(1 for e in self.entries if e.status == "failed")
             total = len(self.entries)
             
@@ -181,7 +192,7 @@ class ProgressTracker:
             table.add_row(
                 "",
                 "SUMMARY",
-                f"Total:{total} Done:{completed}",
+                f"Total:{total} Done:{done}",
                 f"Failed:{failed}",
                 f"{total_tokens:,}",
                 "",
@@ -633,8 +644,13 @@ If the tests are not passing yet, please:
                 except Exception as eval_error:
                     status.error = f"Evaluation error: {eval_error}"
                     result_data["evaluation_error"] = str(eval_error)
+                
+                # Mark as done after evaluation completes
+                status.status = "done"
+            else:
+                # OpenCode failed, no evaluation performed
+                status.status = "failed"
             
-            status.status = "completed" if exit_code == 0 else "failed"
             status.end_time = datetime.now()
             
             if not result_data["success"]:
