@@ -323,8 +323,98 @@ def run_model(model_name: str, entry: dict, repo_path: Path, output_dir: Path, s
         return None
 
 
+def run_single_opencode_session(
+    prompt: str,
+    repo_path: Path,
+    env: dict,
+    opencode_model: str | None,
+    session_id: str | None,
+    status: EntryStatus,
+) -> tuple[int, list[str], list[str], list[dict], str | None]:
+    """Run a single OpenCode session (initial or continuation).
+    
+    Returns: (exit_code, stdout_lines, stderr_lines, json_events, session_id)
+    """
+    # Build OpenCode command
+    cmd = ["opencode", "run", "--format", "json"]
+    
+    if opencode_model:
+        cmd.extend(["--model", opencode_model])
+    
+    if session_id:
+        # Continue existing session
+        cmd.extend(["--session", session_id])
+    
+    cmd.append(prompt)
+    
+    # Run opencode with Popen to stream output line by line
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,  # Line buffered
+        cwd=str(repo_path),
+        env=env,
+    )
+    
+    stdout_lines = []
+    stderr_lines = []
+    json_events = []
+    extracted_session_id = session_id
+    
+    # Read stdout line by line as they come in
+    if process.stdout:
+        for line in process.stdout:
+            line = line.rstrip()
+            if line:
+                stdout_lines.append(line)
+                try:
+                    event = json.loads(line)
+                    json_events.append(event)
+                    
+                    # Extract session ID from first event
+                    if not extracted_session_id and "session" in event:
+                        session_data = event.get("session", {})
+                        if isinstance(session_data, dict):
+                            extracted_session_id = session_data.get("id")
+                    
+                    # Track token usage from step_finish events
+                    if event.get("type") == "step_finish":
+                        part = event.get("part", {})
+                        tokens_data = part.get("tokens", {})
+                        if tokens_data:
+                            # Sum up input, output, and cache read tokens
+                            input_tokens = tokens_data.get("input", 0)
+                            output_tokens = tokens_data.get("output", 0)
+                            cache_read = tokens_data.get("cache", {}).get("read", 0)
+                            
+                            # Update cumulative token count
+                            step_total = input_tokens + output_tokens + cache_read
+                            status.tokens_used += step_total
+                except json.JSONDecodeError:
+                    # Not JSON, skip
+                    pass
+    
+    # Wait for process to complete and get exit code
+    process.wait()
+    
+    # Read any remaining stderr
+    if process.stderr:
+        stderr_output = process.stderr.read()
+        if stderr_output:
+            stderr_lines = stderr_output.strip().split("\n")
+    
+    return process.returncode, stdout_lines, stderr_lines, json_events, extracted_session_id
+
+
 def run_opencode(entry: dict, repo_path: Path, output_dir: Path, status: EntryStatus, live, opencode_model: str | None = None) -> dict:
     """Invoke OpenCode to solve the issue described in the entry.
+    
+    Implements session continuation to work around the 5-minute timeout limit.
+    If OpenCode times out or exits without completing tests, it will continue
+    the session up to MAX_CONTINUATIONS times.
     
     Returns a result dictionary with success status and metadata.
     """
@@ -332,11 +422,15 @@ def run_opencode(entry: dict, repo_path: Path, output_dir: Path, status: EntrySt
     problem_statement = entry.get("problem_statement", "")
     fail_to_pass = entry.get("FAIL_TO_PASS", "")
     
+    MAX_CONTINUATIONS = 30  # Maximum number of times to continue a session
+    
     result_data = {
         "instance_id": instance_id,
         "timestamp": datetime.now().isoformat(),
         "success": False,
         "error": None,
+        "continuations": 0,
+        "all_json_events": [],
     }
     
     if not problem_statement:
@@ -367,8 +461,8 @@ def run_opencode(entry: dict, repo_path: Path, output_dir: Path, status: EntrySt
         result_data["error"] = status.error
         return result_data
     
-    # Construct the prompt for OpenCode
-    prompt = f"""Please solve the following issue:
+    # Construct the initial prompt for OpenCode
+    initial_prompt = f"""Please solve the following issue:
 
 {problem_statement}
 
@@ -381,6 +475,16 @@ Please:
 3. Run the tests to verify your solution works
 """
     
+    # Construct the continuation prompt
+    continuation_prompt = f"""Please continue working on the issue. Check if the tests pass now:
+{fail_to_pass}
+
+If the tests are not passing yet, please:
+1. Review the test failures
+2. Update your implementation to fix any remaining issues
+3. Run the tests again to verify
+"""
+    
     # Invoke OpenCode CLI in non-interactive mode with streaming output
     try:
         # Set environment to disable TTY/interactive mode
@@ -388,7 +492,10 @@ Please:
         env["CI"] = "true"  # Many tools detect CI mode and disable interactive features
         
         status.status = "running"
-        status.start_time = datetime.now()
+        if not status.start_time:
+            status.start_time = datetime.now()
+        if opencode_model and not status.model:
+            status.model = opencode_model
         live.update(tracker.generate_table(), refresh=True)
         
         # Start a background thread to update the display periodically
@@ -403,80 +510,78 @@ Please:
         updater_thread.start()
         
         try:
-            # Build OpenCode command
-            cmd = ["opencode", "run", "--format", "json"]
-            if opencode_model:
-                cmd.extend(["--model", opencode_model])
-                status.model = opencode_model
-            cmd.append(prompt)
+            session_id = None
+            continuation_count = 0
+            all_stdout = []
+            all_stderr = []
             
-            # Run opencode with Popen to stream output line by line
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                stdin=subprocess.DEVNULL,
-                text=True,
-                bufsize=1,  # Line buffered
-                cwd=str(repo_path),
-                env=env,
+            # Run initial session
+            exit_code, stdout_lines, stderr_lines, json_events, session_id = run_single_opencode_session(
+                initial_prompt, repo_path, env, opencode_model, None, status
             )
             
-            stdout_lines = []
-            stderr_lines = []
-            json_events = []
+            all_stdout.extend(stdout_lines)
+            all_stderr.extend(stderr_lines)
+            result_data["all_json_events"].extend(json_events)
             
-            # Read stdout line by line as they come in
-            try:
-                if process.stdout:
-                    for line in process.stdout:
-                        line = line.rstrip()
-                        if line:
-                            stdout_lines.append(line)
-                            try:
-                                event = json.loads(line)
-                                json_events.append(event)
-                                
-                                # Track token usage from step_finish events
-                                if event.get("type") == "step_finish":
-                                    part = event.get("part", {})
-                                    tokens_data = part.get("tokens", {})
-                                    if tokens_data:
-                                        # Sum up input, output, and cache read tokens
-                                        input_tokens = tokens_data.get("input", 0)
-                                        output_tokens = tokens_data.get("output", 0)
-                                        cache_read = tokens_data.get("cache", {}).get("read", 0)
-                                        
-                                        # Update cumulative token count
-                                        step_total = input_tokens + output_tokens + cache_read
-                                        status.tokens_used += step_total
-                            except json.JSONDecodeError:
-                                # Not JSON, skip
-                                pass
-                
-                # Wait for process to complete and get exit code
-                process.wait(timeout=600)
-                
-                # Read any remaining stderr
-                if process.stderr:
-                    stderr_output = process.stderr.read()
-                    if stderr_output:
-                        stderr_lines = stderr_output.strip().split("\n")
+            # Continue session if needed (timeout or incomplete)
+            while continuation_count < MAX_CONTINUATIONS and exit_code == 0:
+                # Check if we should continue by trying to evaluate
+                # If tests pass, we're done. If not, continue the session.
+                try:
+                    eval_result = evaluate_solution(
+                        repo_path, 
+                        entry, 
+                        test_timeout=300,
+                        use_llm=False,  # Quick test check, no LLM
+                    )
                     
-            except subprocess.TimeoutExpired:
-                process.kill()
-                raise
+                    # If tests pass, we're done!
+                    if eval_result.success:
+                        break
+                    
+                    # Tests didn't pass and we have a session - continue working
+                    if session_id:
+                        continuation_count += 1
+                        result_data["continuations"] = continuation_count
+                        
+                        # Run continuation session
+                        exit_code, stdout_lines, stderr_lines, json_events, session_id = run_single_opencode_session(
+                            continuation_prompt, repo_path, env, opencode_model, session_id, status
+                        )
+                        
+                        all_stdout.extend(stdout_lines)
+                        all_stderr.extend(stderr_lines)
+                        result_data["all_json_events"].extend(json_events)
+                    else:
+                        # No session ID to continue
+                        break
+                    
+                except Exception:
+                    # Evaluation failed, but continue anyway
+                    if session_id and continuation_count < MAX_CONTINUATIONS:
+                        continuation_count += 1
+                        result_data["continuations"] = continuation_count
+                        
+                        exit_code, stdout_lines, stderr_lines, json_events, session_id = run_single_opencode_session(
+                            continuation_prompt, repo_path, env, opencode_model, session_id, status
+                        )
+                        
+                        all_stdout.extend(stdout_lines)
+                        all_stderr.extend(stderr_lines)
+                        result_data["all_json_events"].extend(json_events)
+                    else:
+                        break
             
-            result_data["exit_code"] = process.returncode
-            result_data["stdout"] = "\n".join(stdout_lines)
-            result_data["stderr"] = "\n".join(stderr_lines) if stderr_lines else ""
-            result_data["success"] = process.returncode == 0
-            result_data["json_events"] = json_events
+            result_data["exit_code"] = exit_code
+            result_data["stdout"] = "\n".join(all_stdout)
+            result_data["stderr"] = "\n".join(all_stderr) if all_stderr else ""
+            result_data["success"] = exit_code == 0
+            result_data["session_id"] = session_id
             
-            # Calculate final token count from all step_finish events
-            # (in case we missed any during streaming)
+            # Calculate final token count from all events
             total_tokens = 0
-            for event in json_events:
+            for event in result_data["all_json_events"]:
                 if event.get("type") == "step_finish":
                     part = event.get("part", {})
                     tokens_data = part.get("tokens", {})
@@ -489,8 +594,8 @@ Please:
             status.tokens_used = total_tokens
             result_data["tokens_used"] = status.tokens_used
             
-            # Evaluate the solution if OpenCode completed successfully
-            if process.returncode == 0:
+            # Final evaluation with LLM
+            if exit_code == 0:
                 status.status = "evaluating"
                 live.update(tracker.generate_table(), refresh=True)
                 
@@ -529,7 +634,7 @@ Please:
                     status.error = f"Evaluation error: {eval_error}"
                     result_data["evaluation_error"] = str(eval_error)
             
-            status.status = "completed" if process.returncode == 0 else "failed"
+            status.status = "completed" if exit_code == 0 else "failed"
             status.end_time = datetime.now()
             
             if not result_data["success"]:
@@ -542,12 +647,6 @@ Please:
             
     except FileNotFoundError:
         error_msg = "OpenCode CLI not found in PATH"
-        status.status = "failed"
-        status.error = error_msg
-        status.end_time = datetime.now()
-        result_data["error"] = error_msg
-    except subprocess.TimeoutExpired:
-        error_msg = "OpenCode timed out after 10 minutes"
         status.status = "failed"
         status.error = error_msg
         status.end_time = datetime.now()
