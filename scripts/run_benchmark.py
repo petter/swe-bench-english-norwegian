@@ -773,23 +773,45 @@ def process_entries(
     
     # Save summary of all results after TUI closes
     if results:
+        # Calculate evaluation metrics
+        completed_runs = sum(1 for r in results if r.get("success"))  # OpenCode finished without crashing
+        resolved_issues = sum(1 for r in results if r.get("evaluation", {}).get("success"))  # Tests actually passed
+        partial_issues = sum(1 for r in results 
+                            if r.get("evaluation", {}).get("resolved") 
+                            and not r.get("evaluation", {}).get("success"))
+        failed_issues = len(results) - resolved_issues - partial_issues
+        
+        # Calculate average LLM score
+        llm_scores = [r.get("llm_evaluation", {}).get("correctness_score", 0.0) 
+                     for r in results 
+                     if r.get("llm_evaluation")]
+        avg_llm_score = sum(llm_scores) / len(llm_scores) if llm_scores else 0.0
+        
         summary_file = output_dir / "summary.json"
         with summary_file.open("w", encoding="utf-8") as f:
             json.dump(
                 {
                     "total": len(results),
-                    "successful": sum(1 for r in results if r.get("success")),
-                    "failed": sum(1 for r in results if not r.get("success")),
+                    "completed_runs": completed_runs,
+                    "resolved": resolved_issues,
+                    "partial": partial_issues,
+                    "failed": failed_issues,
                     "total_tokens": sum(r.get("tokens_used", 0) for r in results),
+                    "avg_llm_score": avg_llm_score,
                     "results": results,
                 },
                 f,
                 indent=2,
             )
         
+        accuracy_pct = f"{resolved_issues*100//len(results)}%" if results else "0%"
+        
         print(f"\n{'='*80}")
         print(f"Summary saved to {summary_file}")
-        print(f"Total: {len(results)}, Successful: {sum(1 for r in results if r.get('success'))}")
+        print(f"Total entries: {len(results)}")
+        print(f"Completed runs: {completed_runs} (OpenCode finished successfully)")
+        print(f"Resolved: {resolved_issues}, Partial: {partial_issues}, Failed: {failed_issues}")
+        print(f"Accuracy: {accuracy_pct} | Avg LLM score: {avg_llm_score:.2f}")
         print(f"Total tokens used: {sum(r.get('tokens_used', 0) for r in results):,}")
         print(f"{'='*80}")
 
