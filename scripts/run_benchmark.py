@@ -28,6 +28,8 @@ from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 
+from evaluate import EvaluationResult, evaluate_solution
+
 
 DEFAULT_DATASET_PATH = Path("data/raw/test.jsonl")
 DEFAULT_WORKTREE_ROOT = Path("/tmp/bench-english-norwegian")
@@ -40,11 +42,12 @@ class EntryStatus:
     def __init__(self, instance_id: str, repo: str):
         self.instance_id = instance_id
         self.repo = repo
-        self.status = "pending"  # pending, cloning, running, completed, failed
+        self.status = "pending"  # pending, cloning, running, evaluating, completed, failed
         self.tokens_used = 0
         self.start_time: datetime | None = None
         self.end_time: datetime | None = None
         self.error: str | None = None
+        self.evaluation: EvaluationResult | None = None
         
     @property
     def elapsed_time(self) -> str:
@@ -65,10 +68,40 @@ class EntryStatus:
             "pending": "⏳",
             "cloning": "📥",
             "running": "🔄",
+            "evaluating": "🧪",
             "completed": "✅",
             "failed": "❌",
         }
         return icons.get(self.status, "❓")
+    
+    @property
+    def eval_status(self) -> str:
+        """Get evaluation status for display."""
+        if not self.evaluation:
+            return "-"
+        
+        # Show LLM score if available
+        if self.evaluation.llm_evaluation:
+            score = self.evaluation.llm_evaluation.correctness_score
+            score_str = f"({score:.1f})"
+        else:
+            score_str = ""
+        
+        if self.evaluation.success:
+            return f"✅ Resolved {score_str}"
+        elif self.evaluation.resolved and not self.evaluation.maintained:
+            return f"⚠️  Partial {score_str}"
+        else:
+            return f"❌ Failed {score_str}"
+    
+    @property
+    def test_results(self) -> str:
+        """Get test results summary for display."""
+        if not self.evaluation:
+            return "-"
+        f2p = f"{self.evaluation.fail_to_pass_passed}/{self.evaluation.fail_to_pass_total}"
+        p2p = f"{self.evaluation.pass_to_pass_passed}/{self.evaluation.pass_to_pass_total}"
+        return f"F2P:{f2p} P2P:{p2p}"
 
 
 class ProgressTracker:
@@ -90,21 +123,25 @@ class ProgressTracker:
         """Generate the Rich table for live display."""
         table = Table(title="SWE-Bench Progress", show_lines=True)
         table.add_column("#", style="cyan", width=4)
-        table.add_column("Status", width=8)
-        table.add_column("Instance ID", style="yellow", width=30)
-        table.add_column("Repository", style="blue", width=25)
-        table.add_column("Tokens", style="green", justify="right", width=10)
-        table.add_column("Time", style="magenta", width=10)
+        table.add_column("Status", width=11)
+        table.add_column("Instance ID", style="yellow", width=24)
+        table.add_column("Repository", style="blue", width=18)
+        table.add_column("Tokens", style="green", justify="right", width=8)
+        table.add_column("Time", style="magenta", width=8)
+        table.add_column("Result", width=19)
+        table.add_column("Tests", width=30)
         
         with self.lock:
             for idx, entry in enumerate(self.entries, start=1):
                 table.add_row(
                     str(idx),
                     f"{entry.status_icon} {entry.status}",
-                    entry.instance_id,
-                    entry.repo.split("/")[-1],  # Show just repo name
+                    entry.instance_id[:25],  # Truncate long IDs
+                    entry.repo.split("/")[-1][:20],  # Show just repo name, truncated
                     str(entry.tokens_used) if entry.tokens_used > 0 else "-",
                     entry.elapsed_time,
+                    entry.eval_status,
+                    entry.test_results,
                 )
                 
             # Add summary row
@@ -113,14 +150,30 @@ class ProgressTracker:
             failed = sum(1 for e in self.entries if e.status == "failed")
             total = len(self.entries)
             
+            # Calculate evaluation metrics
+            evaluated = sum(1 for e in self.entries if e.evaluation is not None)
+            resolved = sum(1 for e in self.entries if e.evaluation and e.evaluation.success)
+            partial = sum(1 for e in self.entries if e.evaluation and e.evaluation.resolved and not e.evaluation.maintained)
+            
+            # Calculate average LLM score
+            llm_scores = [e.evaluation.llm_evaluation.correctness_score 
+                         for e in self.entries 
+                         if e.evaluation and e.evaluation.llm_evaluation]
+            avg_llm_score = sum(llm_scores) / len(llm_scores) if llm_scores else 0.0
+            
+            accuracy = f"{resolved}/{evaluated}" if evaluated > 0 else "0/0"
+            accuracy_pct = f"{resolved*100//evaluated}%" if evaluated > 0 else "0%"
+            
             table.add_section()
             table.add_row(
-                "📊",
-                "SUMMARY",
-                f"Total: {total} | Done: {completed} | Failed: {failed}",
                 "",
+                "SUMMARY",
+                f"Total:{total} Done:{completed}",
+                f"Failed:{failed}",
                 f"{total_tokens:,}",
                 "",
+                f"Pass:{resolved} Part:{partial} Fail:{evaluated-resolved-partial}",
+                f"Acc:{accuracy_pct} LLM:{avg_llm_score:.2f}",
                 style="bold",
             )
         
@@ -391,6 +444,46 @@ Please:
             result_data["success"] = process.returncode == 0
             result_data["json_events"] = json_events
             result_data["tokens_used"] = status.tokens_used
+            
+            # Evaluate the solution if OpenCode completed successfully
+            if process.returncode == 0:
+                status.status = "evaluating"
+                live.update(tracker.generate_table(), refresh=True)
+                
+                try:
+                    eval_result = evaluate_solution(
+                        repo_path, 
+                        entry, 
+                        test_timeout=300,
+                        use_llm=True,  # Enable LLM evaluation
+                    )
+                    status.evaluation = eval_result
+                    result_data["evaluation"] = {
+                        "resolved": eval_result.resolved,
+                        "maintained": eval_result.maintained,
+                        "fail_to_pass_total": eval_result.fail_to_pass_total,
+                        "fail_to_pass_passed": eval_result.fail_to_pass_passed,
+                        "pass_to_pass_total": eval_result.pass_to_pass_total,
+                        "pass_to_pass_passed": eval_result.pass_to_pass_passed,
+                        "status": eval_result.status,
+                        "success": eval_result.success,
+                        "error": eval_result.error,
+                    }
+                    
+                    # Add LLM evaluation results if available
+                    if eval_result.llm_evaluation:
+                        result_data["llm_evaluation"] = {
+                            "correctness_score": eval_result.llm_evaluation.correctness_score,
+                            "reasoning": eval_result.llm_evaluation.reasoning,
+                            "addresses_issue": eval_result.llm_evaluation.addresses_issue,
+                            "implementation_quality": eval_result.llm_evaluation.implementation_quality,
+                            "potential_issues": eval_result.llm_evaluation.potential_issues,
+                        }
+                    
+                    result_data["test_output"] = eval_result.test_output
+                except Exception as eval_error:
+                    status.error = f"Evaluation error: {eval_error}"
+                    result_data["evaluation_error"] = str(eval_error)
             
             status.status = "completed" if process.returncode == 0 else "failed"
             status.end_time = datetime.now()
