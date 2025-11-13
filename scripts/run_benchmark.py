@@ -122,7 +122,19 @@ class ProgressTracker:
     
     def generate_table(self) -> Table:
         """Generate the Rich table for live display."""
-        table = Table(title="SWE-Bench Progress", show_lines=True)
+        # Get model name for display (to show in title)
+        model_display = "unknown"
+        with self.lock:
+            if self.entries:
+                first_model = self.entries[0].model
+                if first_model:
+                    # Extract just the model name after / if present
+                    if "/" in first_model:
+                        model_display = first_model.split("/")[-1]
+                    else:
+                        model_display = first_model
+        
+        table = Table(title=f"SWE-Bench Progress | Model: {model_display}", show_lines=True)
         table.add_column("#", style="cyan", width=4)
         table.add_column("Status", width=11)
         table.add_column("Instance ID", style="yellow", width=28)
@@ -151,17 +163,6 @@ class ProgressTracker:
             failed = sum(1 for e in self.entries if e.status == "failed")
             total = len(self.entries)
             
-            # Get model name for display
-            model_display = "unknown"
-            if self.entries:
-                first_model = self.entries[0].model
-                if first_model:
-                    # Extract just the model name after / if present
-                    if "/" in first_model:
-                        model_display = first_model.split("/")[-1]
-                    else:
-                        model_display = first_model
-            
             # Calculate evaluation metrics
             evaluated = sum(1 for e in self.entries if e.evaluation is not None)
             resolved = sum(1 for e in self.entries if e.evaluation and e.evaluation.success)
@@ -180,8 +181,8 @@ class ProgressTracker:
             table.add_row(
                 "",
                 "SUMMARY",
-                f"Model:{model_display}",
-                f"Total:{total} Done:{completed} Fail:{failed}",
+                f"Total:{total} Done:{completed}",
+                f"Failed:{failed}",
                 f"{total_tokens:,}",
                 "",
                 f"Pass:{resolved} Part:{partial} Fail:{evaluated-resolved-partial}",
