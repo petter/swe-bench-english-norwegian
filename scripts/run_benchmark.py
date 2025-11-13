@@ -43,7 +43,8 @@ class EntryStatus:
         self.instance_id = instance_id
         self.repo = repo
         self.status = "pending"  # pending, cloning, running, evaluating, done, failed
-        self.tokens_used = 0
+        self.tokens_input = 0
+        self.tokens_output = 0
         self.model: str | None = None
         self.start_time: datetime | None = None
         self.end_time: datetime | None = None
@@ -51,6 +52,11 @@ class EntryStatus:
         self.evaluation: EvaluationResult | None = None
         self.session_id: str | None = None
         self.continuations: int = 0
+    
+    @property
+    def tokens_used(self) -> int:
+        """Get total tokens (input + output) for backward compatibility."""
+        return self.tokens_input + self.tokens_output
         
     @property
     def elapsed_time(self) -> str:
@@ -164,7 +170,8 @@ class ProgressTracker:
         table.add_column("Instance ID", style="yellow")
         table.add_column("Repository", style="blue")
         table.add_column("Session", style="dim", width=12)
-        table.add_column("Tokens", style="green", justify="right", width=8)
+        table.add_column("In Tok", style="green", justify="right", width=8)
+        table.add_column("Out Tok", style="green", justify="right", width=8)
         table.add_column("Time", style="magenta", width=8)
         table.add_column("Result")
         table.add_column("Tests")
@@ -177,14 +184,16 @@ class ProgressTracker:
                     entry.instance_id[:28],  # Truncate long IDs
                     entry.repo.split("/")[-1][:20],  # Show just repo name, truncated
                     entry.session_info,
-                    str(entry.tokens_used) if entry.tokens_used > 0 else "-",
+                    str(entry.tokens_input) if entry.tokens_input > 0 else "-",
+                    str(entry.tokens_output) if entry.tokens_output > 0 else "-",
                     entry.elapsed_time,
                     entry.eval_status,
                     entry.test_results,
                 )
                 
             # Add summary row
-            total_tokens = sum(e.tokens_used for e in self.entries)
+            total_input = sum(e.tokens_input for e in self.entries)
+            total_output = sum(e.tokens_output for e in self.entries)
             done = sum(1 for e in self.entries if e.status == "done")
             failed = sum(1 for e in self.entries if e.status == "failed")
             total = len(self.entries)
@@ -210,7 +219,8 @@ class ProgressTracker:
                 f"Total:{total} Done:{done}",
                 f"Failed:{failed}",
                 "",  # Session column
-                f"{total_tokens:,}",
+                f"{total_input:,}",
+                f"{total_output:,}",
                 "",
                 f"Pass:{resolved} Part:{partial} Fail:{evaluated-resolved-partial}",
                 f"Acc:{accuracy_pct} LLM:{avg_llm_score:.2f}",
@@ -411,14 +421,15 @@ def run_single_opencode_session(
                         part = event.get("part", {})
                         tokens_data = part.get("tokens", {})
                         if tokens_data:
-                            # Sum up input, output, and cache read tokens
+                            # Track input and output tokens separately
                             input_tokens = tokens_data.get("input", 0)
                             output_tokens = tokens_data.get("output", 0)
                             cache_read = tokens_data.get("cache", {}).get("read", 0)
                             
-                            # Update cumulative token count
-                            step_total = input_tokens + output_tokens + cache_read
-                            status.tokens_used += step_total
+                            # Update cumulative token counts
+                            # Input tokens include both input and cache reads
+                            status.tokens_input += input_tokens + cache_read
+                            status.tokens_output += output_tokens
                 except json.JSONDecodeError:
                     # Not JSON, skip
                     pass
@@ -602,8 +613,9 @@ If the tests are not passing yet, please:
             result_data["success"] = exit_code == 0
             result_data["session_id"] = session_id
             
-            # Calculate final token count from all events
-            total_tokens = 0
+            # Calculate final token counts from all events (double-check)
+            total_input = 0
+            total_output = 0
             for event in result_data["all_json_events"]:
                 if event.get("type") == "step_finish":
                     part = event.get("part", {})
@@ -612,10 +624,13 @@ If the tests are not passing yet, please:
                         input_tokens = tokens_data.get("input", 0)
                         output_tokens = tokens_data.get("output", 0)
                         cache_read = tokens_data.get("cache", {}).get("read", 0)
-                        total_tokens += input_tokens + output_tokens + cache_read
+                        total_input += input_tokens + cache_read
+                        total_output += output_tokens
             
-            status.tokens_used = total_tokens
-            result_data["tokens_used"] = status.tokens_used
+            # Store token counts in result data
+            result_data["tokens_input"] = total_input
+            result_data["tokens_output"] = total_output
+            result_data["tokens_used"] = total_input + total_output
             
             # Final evaluation with LLM
             # Always evaluate if we have a session (even if exit_code != 0)
@@ -803,6 +818,11 @@ def process_entries(
                      if r.get("llm_evaluation")]
         avg_llm_score = sum(llm_scores) / len(llm_scores) if llm_scores else 0.0
         
+        # Calculate token totals
+        total_input = sum(r.get("tokens_input", 0) for r in results)
+        total_output = sum(r.get("tokens_output", 0) for r in results)
+        total_tokens = sum(r.get("tokens_used", 0) for r in results)
+        
         summary_file = output_dir / "summary.json"
         with summary_file.open("w", encoding="utf-8") as f:
             json.dump(
@@ -812,7 +832,9 @@ def process_entries(
                     "resolved": resolved_issues,
                     "partial": partial_issues,
                     "failed": failed_issues,
-                    "total_tokens": sum(r.get("tokens_used", 0) for r in results),
+                    "total_tokens": total_tokens,
+                    "total_input_tokens": total_input,
+                    "total_output_tokens": total_output,
                     "avg_llm_score": avg_llm_score,
                     "results": results,
                 },
@@ -828,7 +850,7 @@ def process_entries(
         print(f"Completed runs: {completed_runs} (OpenCode finished successfully)")
         print(f"Resolved: {resolved_issues}, Partial: {partial_issues}, Failed: {failed_issues}")
         print(f"Accuracy: {accuracy_pct} | Avg LLM score: {avg_llm_score:.2f}")
-        print(f"Total tokens used: {sum(r.get('tokens_used', 0) for r in results):,}")
+        print(f"Total tokens used: {total_tokens:,} (input: {total_input:,}, output: {total_output:,})")
         print(f"{'='*80}")
 
 
