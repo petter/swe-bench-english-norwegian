@@ -44,6 +44,7 @@ class EntryStatus:
         self.repo = repo
         self.status = "pending"  # pending, cloning, running, evaluating, completed, failed
         self.tokens_used = 0
+        self.model: str | None = None
         self.start_time: datetime | None = None
         self.end_time: datetime | None = None
         self.error: str | None = None
@@ -125,7 +126,8 @@ class ProgressTracker:
         table.add_column("#", style="cyan", width=4)
         table.add_column("Status", width=11)
         table.add_column("Instance ID", style="yellow", width=24)
-        table.add_column("Repository", style="blue", width=18)
+        table.add_column("Repository", style="blue", width=16)
+        table.add_column("Model", style="cyan", width=12)
         table.add_column("Tokens", style="green", justify="right", width=8)
         table.add_column("Time", style="magenta", width=8)
         table.add_column("Result", width=19)
@@ -137,7 +139,8 @@ class ProgressTracker:
                     str(idx),
                     f"{entry.status_icon} {entry.status}",
                     entry.instance_id[:25],  # Truncate long IDs
-                    entry.repo.split("/")[-1][:20],  # Show just repo name, truncated
+                    entry.repo.split("/")[-1][:16],  # Show just repo name, truncated
+                    entry.model[:12] if entry.model else "-",
                     str(entry.tokens_used) if entry.tokens_used > 0 else "-",
                     entry.elapsed_time,
                     entry.eval_status,
@@ -170,6 +173,7 @@ class ProgressTracker:
                 "SUMMARY",
                 f"Total:{total} Done:{completed}",
                 f"Failed:{failed}",
+                "",
                 f"{total_tokens:,}",
                 "",
                 f"Pass:{resolved} Part:{partial} Fail:{evaluated-resolved-partial}",
@@ -227,6 +231,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=32,
         help="Number of parallel workers to run (default: 32).",
+    )
+    parser.add_argument(
+        "--opencode-model",
+        default=None,
+        help="Specific OpenCode model to use (e.g., anthropic/claude-sonnet-4). If not specified, uses OpenCode's default.",
     )
     return parser.parse_args()
 
@@ -286,7 +295,7 @@ def checkout_commit(repo_path: Path, commit: str) -> None:
     run_git_command(["checkout", "--force", commit], cwd=repo_path, quiet=True)
 
 
-def run_model(model_name: str, entry: dict, repo_path: Path, output_dir: Path, status: EntryStatus, live) -> dict | None:
+def run_model(model_name: str, entry: dict, repo_path: Path, output_dir: Path, status: EntryStatus, live, opencode_model: str | None = None) -> dict | None:
     """Run the specified model/agent on the repository.
     
     For OpenCode, this invokes the CLI with the problem statement and lets
@@ -297,7 +306,7 @@ def run_model(model_name: str, entry: dict, repo_path: Path, output_dir: Path, s
     instance_id = entry.get("instance_id", "unknown")
     
     if model_name == "opencode":
-        return run_opencode(entry, repo_path, output_dir, status, live)
+        return run_opencode(entry, repo_path, output_dir, status, live, opencode_model)
     else:
         status.status = "failed"
         status.error = f"Unknown model: {model_name}"
@@ -305,7 +314,7 @@ def run_model(model_name: str, entry: dict, repo_path: Path, output_dir: Path, s
         return None
 
 
-def run_opencode(entry: dict, repo_path: Path, output_dir: Path, status: EntryStatus, live) -> dict:
+def run_opencode(entry: dict, repo_path: Path, output_dir: Path, status: EntryStatus, live, opencode_model: str | None = None) -> dict:
     """Invoke OpenCode to solve the issue described in the entry.
     
     Returns a result dictionary with success status and metadata.
@@ -385,9 +394,18 @@ Please:
         updater_thread.start()
         
         try:
+            # Build OpenCode command
+            cmd = ["opencode", "run", "--format", "json"]
+            if opencode_model:
+                cmd.extend(["--model", opencode_model])
+                status.model = opencode_model
+            else:
+                status.model = "default"
+            cmd.append(prompt)
+            
             # Run opencode with Popen to stream output line by line
             process = subprocess.Popen(
-                ["opencode", "run", "--format", "json", prompt],
+                cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 stdin=subprocess.DEVNULL,
@@ -556,7 +574,8 @@ def process_single_entry(
     model_name: str, 
     workdir_root: Path, 
     output_dir: Path, 
-    live: Live
+    live: Live,
+    opencode_model: str | None = None,
 ) -> dict | None:
     """Process a single entry (used by worker threads)."""
     repo = entry["repo"]
@@ -571,7 +590,7 @@ def process_single_entry(
         checkout_commit(repo_path, commit)
         
         # Run the model (this will update status internally)
-        result = run_model(model_name, entry, repo_path, output_dir, status, live)
+        result = run_model(model_name, entry, repo_path, output_dir, status, live, opencode_model)
         return result
         
     except Exception as e:
@@ -582,7 +601,7 @@ def process_single_entry(
 
 
 def process_entries(
-    entries: Iterable[dict], model_name: str, workdir_root: Path, output_dir: Path, num_workers: int = 32
+    entries: Iterable[dict], model_name: str, workdir_root: Path, output_dir: Path, num_workers: int = 32, opencode_model: str | None = None
 ) -> None:
     """Process each entry by checking out the repo and running the model in parallel."""
     results = []
@@ -610,7 +629,8 @@ def process_entries(
                     model_name,
                     workdir_root,
                     output_dir,
-                    live
+                    live,
+                    opencode_model,
                 ): entry
                 for entry in entry_list
             }
@@ -661,7 +681,7 @@ def main() -> None:
     try:
         entries = iter_entries(dataset_path, args.limit)
         process_entries(
-            entries, args.model, Path(args.workdir_root), Path(args.output_dir), args.workers
+            entries, args.model, Path(args.workdir_root), Path(args.output_dir), args.workers, args.opencode_model
         )
     except subprocess.CalledProcessError as exc:
         print(f"Command failed with exit code {exc.returncode}.", file=sys.stderr)
