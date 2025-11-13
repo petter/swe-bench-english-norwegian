@@ -245,8 +245,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--opencode-model",
-        default="copilot:anthropic/claude-sonnet-4.5",
-        help="Specific OpenCode model to use (default: copilot:anthropic/claude-sonnet-4.5).",
+        default="github-copilot/claude-sonnet-4.5",
+        help="Specific OpenCode model to use (default: github-copilot/claude-sonnet-4.5).",
     )
     return parser.parse_args()
 
