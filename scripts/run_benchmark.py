@@ -134,15 +134,15 @@ class ProgressTracker:
                     else:
                         model_display = first_model
         
-        table = Table(title=f"SWE-Bench Progress | Model: {model_display}", show_lines=True)
+        table = Table(title=f"SWE-Bench Progress | Model: {model_display}", show_lines=True, expand=True)
         table.add_column("#", style="cyan", width=4)
         table.add_column("Status", width=11)
-        table.add_column("Instance ID", style="yellow", width=28)
-        table.add_column("Repository", style="blue", width=20)
+        table.add_column("Instance ID", style="yellow")
+        table.add_column("Repository", style="blue")
         table.add_column("Tokens", style="green", justify="right", width=8)
         table.add_column("Time", style="magenta", width=8)
-        table.add_column("Result", width=19)
-        table.add_column("Tests", width=30)
+        table.add_column("Result")
+        table.add_column("Tests")
         
         with self.lock:
             for idx, entry in enumerate(self.entries, start=1):
