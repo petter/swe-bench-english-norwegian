@@ -49,6 +49,8 @@ class EntryStatus:
         self.end_time: datetime | None = None
         self.error: str | None = None
         self.evaluation: EvaluationResult | None = None
+        self.session_id: str | None = None
+        self.continuations: int = 0
         
     @property
     def elapsed_time(self) -> str:
@@ -114,6 +116,17 @@ class EntryStatus:
         f2p = f"{self.evaluation.fail_to_pass_passed}/{self.evaluation.fail_to_pass_total}"
         p2p = f"{self.evaluation.pass_to_pass_passed}/{self.evaluation.pass_to_pass_total}"
         return f"F2P:{f2p} P2P:{p2p}"
+    
+    @property
+    def session_info(self) -> str:
+        """Get session ID and continuations for display."""
+        if not self.session_id:
+            return "-"
+        # Show last 8 chars of session ID and continuation count
+        short_id = self.session_id[-8:] if len(self.session_id) > 8 else self.session_id
+        if self.continuations > 0:
+            return f"{short_id} (×{self.continuations})"
+        return short_id
 
 
 class ProgressTracker:
@@ -150,6 +163,7 @@ class ProgressTracker:
         table.add_column("Status", width=11)
         table.add_column("Instance ID", style="yellow")
         table.add_column("Repository", style="blue")
+        table.add_column("Session", style="dim", width=12)
         table.add_column("Tokens", style="green", justify="right", width=8)
         table.add_column("Time", style="magenta", width=8)
         table.add_column("Result")
@@ -162,6 +176,7 @@ class ProgressTracker:
                     f"{entry.status_icon} {entry.status}",
                     entry.instance_id[:28],  # Truncate long IDs
                     entry.repo.split("/")[-1][:20],  # Show just repo name, truncated
+                    entry.session_info,
                     str(entry.tokens_used) if entry.tokens_used > 0 else "-",
                     entry.elapsed_time,
                     entry.eval_status,
@@ -194,6 +209,7 @@ class ProgressTracker:
                 "SUMMARY",
                 f"Total:{total} Done:{done}",
                 f"Failed:{failed}",
+                "",  # Session column
                 f"{total_tokens:,}",
                 "",
                 f"Pass:{resolved} Part:{partial} Fail:{evaluated-resolved-partial}",
@@ -385,11 +401,10 @@ def run_single_opencode_session(
                     event = json.loads(line)
                     json_events.append(event)
                     
-                    # Extract session ID from first event
-                    if not extracted_session_id and "session" in event:
-                        session_data = event.get("session", {})
-                        if isinstance(session_data, dict):
-                            extracted_session_id = session_data.get("id")
+                    # Extract session ID from event
+                    if not extracted_session_id and "sessionID" in event:
+                        extracted_session_id = event.get("sessionID")
+                        status.session_id = extracted_session_id  # Update status for display
                     
                     # Track token usage from step_finish events
                     if event.get("type") == "step_finish":
@@ -536,53 +551,50 @@ If the tests are not passing yet, please:
             result_data["all_json_events"].extend(json_events)
             
             # Continue session if needed (timeout or incomplete)
-            while continuation_count < MAX_CONTINUATIONS and exit_code == 0:
+            # Continue as long as we have a session, regardless of exit code
+            while continuation_count < MAX_CONTINUATIONS and session_id:
                 # Check if we should continue by trying to evaluate
                 # If tests pass, we're done. If not, continue the session.
                 try:
                     eval_result = evaluate_solution(
                         repo_path, 
                         entry, 
-                        test_timeout=300,
+                        test_timeout=60,  # Reduced timeout for quick check
                         use_llm=False,  # Quick test check, no LLM
                     )
                     
                     # If tests pass, we're done!
                     if eval_result.success:
+                        exit_code = 0  # Mark as successful
                         break
                     
-                    # Tests didn't pass and we have a session - continue working
-                    if session_id:
-                        continuation_count += 1
-                        result_data["continuations"] = continuation_count
-                        
-                        # Run continuation session
-                        exit_code, stdout_lines, stderr_lines, json_events, session_id = run_single_opencode_session(
-                            continuation_prompt, repo_path, env, opencode_model, session_id, status
-                        )
-                        
-                        all_stdout.extend(stdout_lines)
-                        all_stderr.extend(stderr_lines)
-                        result_data["all_json_events"].extend(json_events)
-                    else:
-                        # No session ID to continue
-                        break
+                    # Tests didn't pass - continue working
+                    continuation_count += 1
+                    result_data["continuations"] = continuation_count
+                    status.continuations = continuation_count  # Update status for display
+                    
+                    # Run continuation session
+                    exit_code, stdout_lines, stderr_lines, json_events, session_id = run_single_opencode_session(
+                        continuation_prompt, repo_path, env, opencode_model, session_id, status
+                    )
+                    
+                    all_stdout.extend(stdout_lines)
+                    all_stderr.extend(stderr_lines)
+                    result_data["all_json_events"].extend(json_events)
                     
                 except Exception:
-                    # Evaluation failed, but continue anyway
-                    if session_id and continuation_count < MAX_CONTINUATIONS:
-                        continuation_count += 1
-                        result_data["continuations"] = continuation_count
-                        
-                        exit_code, stdout_lines, stderr_lines, json_events, session_id = run_single_opencode_session(
-                            continuation_prompt, repo_path, env, opencode_model, session_id, status
-                        )
-                        
-                        all_stdout.extend(stdout_lines)
-                        all_stderr.extend(stderr_lines)
-                        result_data["all_json_events"].extend(json_events)
-                    else:
-                        break
+                    # Evaluation failed - continue anyway to let agent keep working
+                    continuation_count += 1
+                    result_data["continuations"] = continuation_count
+                    status.continuations = continuation_count  # Update status for display
+                    
+                    exit_code, stdout_lines, stderr_lines, json_events, session_id = run_single_opencode_session(
+                        continuation_prompt, repo_path, env, opencode_model, session_id, status
+                    )
+                    
+                    all_stdout.extend(stdout_lines)
+                    all_stderr.extend(stderr_lines)
+                    result_data["all_json_events"].extend(json_events)
             
             result_data["exit_code"] = exit_code
             result_data["stdout"] = "\n".join(all_stdout)
@@ -606,7 +618,8 @@ If the tests are not passing yet, please:
             result_data["tokens_used"] = status.tokens_used
             
             # Final evaluation with LLM
-            if exit_code == 0:
+            # Always evaluate if we have a session (even if exit_code != 0)
+            if session_id:
                 status.status = "evaluating"
                 live.update(tracker.generate_table(), refresh=True)
                 
@@ -614,7 +627,7 @@ If the tests are not passing yet, please:
                     eval_result = evaluate_solution(
                         repo_path, 
                         entry, 
-                        test_timeout=300,
+                        test_timeout=120,  # Reduced from 300 to 120 seconds
                         use_llm=True,  # Enable LLM evaluation
                     )
                     status.evaluation = eval_result
@@ -641,6 +654,9 @@ If the tests are not passing yet, please:
                         }
                     
                     result_data["test_output"] = eval_result.test_output
+                    
+                    # Update success based on evaluation
+                    result_data["success"] = eval_result.success
                 except Exception as eval_error:
                     status.error = f"Evaluation error: {eval_error}"
                     result_data["evaluation_error"] = str(eval_error)
@@ -648,7 +664,7 @@ If the tests are not passing yet, please:
                 # Mark as done after evaluation completes
                 status.status = "done"
             else:
-                # OpenCode failed, no evaluation performed
+                # No session ID - OpenCode failed to start
                 status.status = "failed"
             
             status.end_time = datetime.now()
