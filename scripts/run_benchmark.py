@@ -125,9 +125,8 @@ class ProgressTracker:
         table = Table(title="SWE-Bench Progress", show_lines=True)
         table.add_column("#", style="cyan", width=4)
         table.add_column("Status", width=11)
-        table.add_column("Instance ID", style="yellow", width=24)
-        table.add_column("Repository", style="blue", width=16)
-        table.add_column("Model", style="cyan", width=12)
+        table.add_column("Instance ID", style="yellow", width=28)
+        table.add_column("Repository", style="blue", width=20)
         table.add_column("Tokens", style="green", justify="right", width=8)
         table.add_column("Time", style="magenta", width=8)
         table.add_column("Result", width=19)
@@ -135,23 +134,11 @@ class ProgressTracker:
         
         with self.lock:
             for idx, entry in enumerate(self.entries, start=1):
-                # Format model name for display (show only last part after :)
-                model_display = "-"
-                if entry.model:
-                    # Extract just the model name after : if present
-                    model_parts = entry.model.split(":")
-                    model_name = model_parts[-1] if len(model_parts) > 1 else entry.model
-                    # Further shorten if needed (e.g., "anthropic/claude-sonnet-4.5" -> "claude-sonnet-4.5")
-                    if "/" in model_name:
-                        model_name = model_name.split("/")[-1]
-                    model_display = model_name[:12]
-                
                 table.add_row(
                     str(idx),
                     f"{entry.status_icon} {entry.status}",
-                    entry.instance_id[:25],  # Truncate long IDs
-                    entry.repo.split("/")[-1][:16],  # Show just repo name, truncated
-                    model_display,
+                    entry.instance_id[:28],  # Truncate long IDs
+                    entry.repo.split("/")[-1][:20],  # Show just repo name, truncated
                     str(entry.tokens_used) if entry.tokens_used > 0 else "-",
                     entry.elapsed_time,
                     entry.eval_status,
@@ -163,6 +150,17 @@ class ProgressTracker:
             completed = sum(1 for e in self.entries if e.status == "completed")
             failed = sum(1 for e in self.entries if e.status == "failed")
             total = len(self.entries)
+            
+            # Get model name for display
+            model_display = "unknown"
+            if self.entries:
+                first_model = self.entries[0].model
+                if first_model:
+                    # Extract just the model name after / if present
+                    if "/" in first_model:
+                        model_display = first_model.split("/")[-1]
+                    else:
+                        model_display = first_model
             
             # Calculate evaluation metrics
             evaluated = sum(1 for e in self.entries if e.evaluation is not None)
@@ -182,9 +180,8 @@ class ProgressTracker:
             table.add_row(
                 "",
                 "SUMMARY",
-                f"Total:{total} Done:{completed}",
-                f"Failed:{failed}",
-                "",
+                f"Model:{model_display}",
+                f"Total:{total} Done:{completed} Fail:{failed}",
                 f"{total_tokens:,}",
                 "",
                 f"Pass:{resolved} Part:{partial} Fail:{evaluated-resolved-partial}",
