@@ -23,18 +23,20 @@ You can override the dataset identifier, split, revision, or output path via com
 
 ## Running the benchmark with OpenCode
 
-The benchmark script now supports running OpenCode as an agent to solve SWE-bench issues with a live progress TUI:
+The benchmark script now supports running OpenCode as an agent to solve SWE-bench issues with a live progress TUI and parallel execution:
 
 ```bash
 python scripts/run_benchmark.py --dataset data/raw/test.jsonl --limit 5
 ```
 
 This will:
-1. Clone the necessary repositories to `/tmp/bench-english-norwegian`
+1. Clone the necessary repositories to `/tmp/bench-english-norwegian/<instance_id>` (each instance gets its own directory)
 2. Check out the appropriate commit for each issue
 3. Invoke OpenCode in non-interactive mode with `--format json` to solve the issue
 4. Display a live TUI showing progress, token usage, and timing for each entry
 5. Save results to the `results/` directory
+
+By default, the script runs 32 workers in parallel to process multiple issues concurrently. Each instance gets its own isolated repository directory to avoid conflicts. You can adjust the number of workers with the `--workers` flag.
 
 ### Live Progress TUI
 
@@ -53,11 +55,12 @@ The TUI updates live as OpenCode processes each entry, so you can track progress
 - `--model`: Model/agent to use (default: `opencode`)
 - `--workdir-root`: Root directory for cloned repositories (default: `/tmp/bench-english-norwegian`)
 - `--output-dir`: Directory to save results and logs (default: `results`)
+- `--workers`: Number of parallel workers to run (default: `32`)
 
-### Example: Run on first 3 issues
+### Example: Run on first 10 issues with 5 parallel workers
 
 ```bash
-python scripts/run_benchmark.py --limit 3 --output-dir results/run1
+python scripts/run_benchmark.py --limit 10 --workers 5 --output-dir results/run1
 ```
 
 ### How it works

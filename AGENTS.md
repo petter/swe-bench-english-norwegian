@@ -3,6 +3,7 @@
 ## Running Scripts
 - Download dataset: `python scripts/download_dataset.py --split test`
 - Run benchmark: `python scripts/run_benchmark.py --dataset data/raw/test.jsonl --limit 5`
+- Run benchmark with parallel workers: `python scripts/run_benchmark.py --dataset data/raw/test.jsonl --workers 32`
 - No test suite currently exists
 
 ## Code Style

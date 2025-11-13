@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -168,6 +169,12 @@ def parse_args() -> argparse.Namespace:
         default=str(DEFAULT_OUTPUT_DIR),
         help="Directory to save results and logs (default: results).",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=32,
+        help="Number of parallel workers to run (default: 32).",
+    )
     return parser.parse_args()
 
 
@@ -192,9 +199,12 @@ def run_git_command(args: list[str], cwd: Path | None = None, quiet: bool = Fals
     subprocess.run(cmd, check=True, capture_output=quiet, text=True)
 
 
-def ensure_repository(repo_slug: str, root: Path) -> Path:
-    repo_name = repo_slug.split("/")[-1]
-    target_dir = root / repo_name
+def ensure_repository(repo_slug: str, root: Path, instance_id: str) -> Path:
+    """Clone or reuse a repository for a specific instance.
+    
+    Each instance gets its own directory to avoid conflicts when running in parallel.
+    """
+    target_dir = root / instance_id
     root.mkdir(parents=True, exist_ok=True)
 
     if target_dir.exists():
@@ -425,10 +435,41 @@ Please:
     return result_data
 
 
+def process_single_entry(
+    entry: dict, 
+    status: EntryStatus, 
+    model_name: str, 
+    workdir_root: Path, 
+    output_dir: Path, 
+    live: Live
+) -> dict | None:
+    """Process a single entry (used by worker threads)."""
+    repo = entry["repo"]
+    commit = entry["base_commit"]
+    instance_id = entry["instance_id"]
+    
+    try:
+        # Update status to cloning
+        status.status = "cloning"
+        
+        repo_path = ensure_repository(repo, workdir_root, instance_id)
+        checkout_commit(repo_path, commit)
+        
+        # Run the model (this will update status internally)
+        result = run_model(model_name, entry, repo_path, output_dir, status, live)
+        return result
+        
+    except Exception as e:
+        status.status = "failed"
+        status.error = str(e)
+        status.end_time = datetime.now()
+        return None
+
+
 def process_entries(
-    entries: Iterable[dict], model_name: str, workdir_root: Path, output_dir: Path
+    entries: Iterable[dict], model_name: str, workdir_root: Path, output_dir: Path, num_workers: int = 32
 ) -> None:
-    """Process each entry by checking out the repo and running the model."""
+    """Process each entry by checking out the repo and running the model in parallel."""
     results = []
     
     # Convert entries to list to get count and pre-register them
@@ -438,40 +479,40 @@ def process_entries(
     for entry in entry_list:
         tracker.add_entry(entry["instance_id"], entry["repo"])
     
-    # Start the live display with auto-refresh disabled (we'll update manually)
+    # Create a mapping from entry to status
+    entry_status_map = {entry["instance_id"]: tracker.entries[idx] for idx, entry in enumerate(entry_list)}
+    
+    # Start the live display
     with Live(tracker.generate_table(), refresh_per_second=4, console=tracker.console, auto_refresh=True) as live:
-        # Update the renderable to use a callable that regenerates the table
-        live.update(tracker.generate_table(), refresh=True)
-        
-        for idx, entry in enumerate(entry_list):
-            status = tracker.entries[idx]
-            repo = entry["repo"]
-            commit = entry["base_commit"]
+        # Use ThreadPoolExecutor for parallel execution
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            # Submit all tasks
+            future_to_entry = {
+                executor.submit(
+                    process_single_entry,
+                    entry,
+                    entry_status_map[entry["instance_id"]],
+                    model_name,
+                    workdir_root,
+                    output_dir,
+                    live
+                ): entry
+                for entry in entry_list
+            }
             
-            try:
-                # Update status to cloning
-                status.status = "cloning"
-                live.update(tracker.generate_table(), refresh=True)
-                
-                repo_path = ensure_repository(repo, workdir_root)
-                checkout_commit(repo_path, commit)
-                
-                # Update live display before running model
-                live.update(tracker.generate_table(), refresh=True)
-                
-                # Run the model (this will update status internally)
-                result = run_model(model_name, entry, repo_path, output_dir, status, live)
-                if result:
-                    results.append(result)
-                    
-                # Update display after completion
-                live.update(tracker.generate_table(), refresh=True)
-                
-            except Exception as e:
-                status.status = "failed"
-                status.error = str(e)
-                status.end_time = datetime.now()
-                live.update(tracker.generate_table(), refresh=True)
+            # Process completed futures as they finish
+            for future in as_completed(future_to_entry):
+                entry = future_to_entry[future]
+                try:
+                    result = future.result()
+                    if result:
+                        results.append(result)
+                except Exception as e:
+                    # Handle any unexpected exceptions from the worker
+                    status = entry_status_map[entry["instance_id"]]
+                    status.status = "failed"
+                    status.error = f"Worker exception: {e}"
+                    status.end_time = datetime.now()
     
     # Save summary of all results after TUI closes
     if results:
@@ -505,7 +546,7 @@ def main() -> None:
     try:
         entries = iter_entries(dataset_path, args.limit)
         process_entries(
-            entries, args.model, Path(args.workdir_root), Path(args.output_dir)
+            entries, args.model, Path(args.workdir_root), Path(args.output_dir), args.workers
         )
     except subprocess.CalledProcessError as exc:
         print(f"Command failed with exit code {exc.returncode}.", file=sys.stderr)
