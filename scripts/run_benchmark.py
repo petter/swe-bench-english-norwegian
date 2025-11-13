@@ -2,23 +2,29 @@
 """Prepare SWE-bench entries for model evaluation.
 
 The script clones (or reuses) repositories referenced by the dataset, checks out
-the commit specified for each entry, and provides a hook for invoking a model
-runner. Only the repository setup is implemented for now; the actual model
-integration can be plugged into :func:`run_model` later on.
+the commit specified for each entry, and invokes OpenCode to solve each issue.
+
+For OpenCode integration, each task is executed in its own shell environment with
+the working directory set to the repository root. This ensures OpenCode operates
+within the proper context, with all permissions pre-configured to allow automated
+execution without user prompts.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Iterator
 
 
 DEFAULT_DATASET_PATH = Path("data/raw/test.jsonl")
 DEFAULT_WORKTREE_ROOT = Path("/tmp/bench-english-norwegian")
+DEFAULT_OUTPUT_DIR = Path("results")
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,8 +50,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default="unspecified",
-        help="Identifier of the model/agent to run for each entry.",
+        default="opencode",
+        help="Identifier of the model/agent to run for each entry (default: opencode).",
     )
     parser.add_argument(
         "--workdir-root",
@@ -54,6 +60,11 @@ def parse_args() -> argparse.Namespace:
             "Root directory for the temporary repositories. Each repo will "
             "live under <root>/<repo-name>."
         ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=str(DEFAULT_OUTPUT_DIR),
+        help="Directory to save results and logs (default: results).",
     )
     return parser.parse_args()
 
@@ -106,22 +117,201 @@ def checkout_commit(repo_path: Path, commit: str) -> None:
     run_git_command(["checkout", "--force", commit], cwd=repo_path)
 
 
-def run_model(model_name: str, entry: dict, repo_path: Path) -> None:
-    # Placeholder hook for the actual model invocation.
-    print(
-        "[TODO] Model '%s' would run on %s located at %s"
-        % (model_name, entry.get("instance_id"), repo_path)
-    )
+def run_model(model_name: str, entry: dict, repo_path: Path, output_dir: Path) -> dict | None:
+    """Run the specified model/agent on the repository.
+    
+    For OpenCode, this invokes the CLI with the problem statement and lets
+    the agent work autonomously to solve the issue.
+    
+    Returns a result dictionary if applicable, None otherwise.
+    """
+    instance_id = entry.get("instance_id", "unknown")
+    
+    if model_name == "opencode":
+        return run_opencode(entry, repo_path, output_dir)
+    else:
+        print(
+            f"[TODO] Model '{model_name}' would run on {instance_id} at {repo_path}"
+        )
+        return None
 
 
-def process_entries(entries: Iterable[dict], model_name: str, workdir_root: Path) -> None:
+def run_opencode(entry: dict, repo_path: Path, output_dir: Path) -> dict:
+    """Invoke OpenCode to solve the issue described in the entry.
+    
+    Returns a result dictionary with success status and metadata.
+    """
+    instance_id = entry.get("instance_id", "unknown")
+    problem_statement = entry.get("problem_statement", "")
+    fail_to_pass = entry.get("FAIL_TO_PASS", "")
+    
+    result_data = {
+        "instance_id": instance_id,
+        "timestamp": datetime.now().isoformat(),
+        "success": False,
+        "error": None,
+    }
+    
+    if not problem_statement:
+        print(f"⚠ No problem statement found for {instance_id}, skipping.")
+        result_data["error"] = "No problem statement"
+        return result_data
+    
+    print(f"\n{'='*80}")
+    print(f"Running OpenCode on {instance_id}")
+    print(f"Repository: {repo_path}")
+    print(f"{'='*80}\n")
+    
+    # Set up OpenCode config in the repository to allow all permissions
+    config_file = repo_path / "opencode.json"
+    config_content = {
+        "$schema": "https://opencode.ai/config.json",
+        "permission": {
+            "edit": "allow",
+            "bash": "allow",
+            "webfetch": "allow",
+        },
+    }
+    
+    try:
+        with config_file.open("w", encoding="utf-8") as f:
+            json.dump(config_content, f, indent=2)
+        print(f"✓ Created opencode.json with 'allow' permissions")
+    except Exception as e:
+        print(f"⚠ Warning: Could not create opencode.json: {e}")
+    
+    # Construct the prompt for OpenCode
+    prompt = f"""Please solve the following issue:
+
+{problem_statement}
+
+The following tests should pass after your fix:
+{fail_to_pass}
+
+Please:
+1. Understand the problem by reading the relevant code
+2. Implement a fix for the issue
+3. Run the tests to verify your solution works
+"""
+    
+    # Invoke OpenCode CLI in non-interactive mode
+    # Run it with cwd set to the repository directory so it operates within that context
+    # Use --format json to get structured output instead of TUI
+    try:
+        # Set environment to disable TTY/interactive mode
+        env = os.environ.copy()
+        env["CI"] = "true"  # Many tools detect CI mode and disable interactive features
+        
+        # Run opencode run with the prompt, executing in the repo directory
+        result = subprocess.run(
+            ["opencode", "run", "--format", "json", prompt],
+            check=False,  # Don't raise on non-zero exit
+            capture_output=True,
+            text=True,
+            timeout=600,  # 10 minute timeout per issue
+            stdin=subprocess.DEVNULL,  # Disable stdin to prevent interactive prompts
+            cwd=str(repo_path),  # Run in the repository directory
+            env=env,
+        )
+        
+        result_data["exit_code"] = result.returncode
+        result_data["stdout"] = result.stdout
+        result_data["stderr"] = result.stderr
+        result_data["success"] = result.returncode == 0
+        
+        print(f"\n{'='*80}")
+        print(f"OpenCode exit code: {result.returncode}")
+        print(f"{'='*80}")
+        
+        # Parse JSON events from stdout if format is json
+        json_events = []
+        if result.stdout:
+            for line in result.stdout.strip().split("\n"):
+                try:
+                    event = json.loads(line)
+                    json_events.append(event)
+                    # Print relevant events
+                    if event.get("type") == "text":
+                        print(event.get("text", ""))
+                    elif event.get("type") == "error":
+                        print(f"Error: {event.get('message', '')}")
+                except json.JSONDecodeError:
+                    # Not JSON, print as-is
+                    print(line)
+        
+        result_data["json_events"] = json_events
+        
+        if result.stderr:
+            print("\nSTDERR:")
+            print(result.stderr)
+            
+    except FileNotFoundError:
+        error_msg = "OpenCode CLI not found in PATH"
+        print(f"❌ {error_msg}")
+        print("   You may need to install it first.")
+        result_data["error"] = error_msg
+    except subprocess.TimeoutExpired:
+        error_msg = "OpenCode timed out after 10 minutes"
+        print(f"⏱ {error_msg}")
+        result_data["error"] = error_msg
+    except Exception as e:
+        error_msg = f"Error running OpenCode: {e}"
+        print(f"❌ {error_msg}")
+        result_data["error"] = error_msg
+    finally:
+        # Clean up the config file
+        try:
+            if config_file.exists():
+                config_file.unlink()
+                print("✓ Cleaned up opencode.json")
+        except Exception as e:
+            print(f"⚠ Warning: Could not remove opencode.json: {e}")
+    
+    # Save individual result
+    output_dir.mkdir(parents=True, exist_ok=True)
+    result_file = output_dir / f"{instance_id}.json"
+    with result_file.open("w", encoding="utf-8") as f:
+        json.dump(result_data, f, indent=2)
+    
+    print(f"\n✓ Result saved to {result_file}")
+    
+    return result_data
+
+
+def process_entries(
+    entries: Iterable[dict], model_name: str, workdir_root: Path, output_dir: Path
+) -> None:
+    """Process each entry by checking out the repo and running the model."""
+    results = []
+    
     for idx, entry in enumerate(entries, start=1):
         repo = entry["repo"]
         commit = entry["base_commit"]
         print(f"\n=== Entry {idx}: {entry['instance_id']} ({repo}@{commit}) ===")
         repo_path = ensure_repository(repo, workdir_root)
         checkout_commit(repo_path, commit)
-        run_model(model_name, entry, repo_path)
+        result = run_model(model_name, entry, repo_path, output_dir)
+        if result:
+            results.append(result)
+    
+    # Save summary of all results
+    if results:
+        summary_file = output_dir / "summary.json"
+        with summary_file.open("w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "total": len(results),
+                    "successful": sum(1 for r in results if r.get("success")),
+                    "failed": sum(1 for r in results if not r.get("success")),
+                    "results": results,
+                },
+                f,
+                indent=2,
+            )
+        print(f"\n{'='*80}")
+        print(f"Summary saved to {summary_file}")
+        print(f"Total: {len(results)}, Successful: {sum(1 for r in results if r.get('success'))}")
+        print(f"{'='*80}")
 
 
 def main() -> None:
@@ -132,7 +322,9 @@ def main() -> None:
 
     try:
         entries = iter_entries(dataset_path, args.limit)
-        process_entries(entries, args.model, Path(args.workdir_root))
+        process_entries(
+            entries, args.model, Path(args.workdir_root), Path(args.output_dir)
+        )
     except subprocess.CalledProcessError as exc:
         print(f"Command failed with exit code {exc.returncode}.", file=sys.stderr)
         raise

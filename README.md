@@ -20,3 +20,50 @@ Experiment sandbox for comparing English vs Norwegian prompts on the `princeton-
    Use `--token` or set `HF_TOKEN` if the dataset requires authentication. The script exports the dataset to `data/raw/<split>.jsonl`.
 
 You can override the dataset identifier, split, revision, or output path via command-line flags. Run `python scripts/download_dataset.py --help` for the full list of options.
+
+## Running the benchmark with OpenCode
+
+The benchmark script now supports running OpenCode as an agent to solve SWE-bench issues:
+
+```bash
+python scripts/run_benchmark.py --dataset data/raw/test.jsonl --limit 5
+```
+
+This will:
+1. Clone the necessary repositories to `/tmp/bench-english-norwegian`
+2. Check out the appropriate commit for each issue
+3. Invoke OpenCode in non-interactive mode with `--format json` to solve the issue
+4. Save results to the `results/` directory
+
+### Options
+
+- `--dataset`: Path to the SWE-bench jsonl file (default: `data/raw/test.jsonl`)
+- `--limit`: Maximum number of entries to process (useful for testing)
+- `--model`: Model/agent to use (default: `opencode`)
+- `--workdir-root`: Root directory for cloned repositories (default: `/tmp/bench-english-norwegian`)
+- `--output-dir`: Directory to save results and logs (default: `results`)
+
+### Example: Run on first 3 issues
+
+```bash
+python scripts/run_benchmark.py --limit 3 --output-dir results/run1
+```
+
+### How it works
+
+The script runs OpenCode in non-interactive mode for each task by:
+- Spawning OpenCode in a shell with the working directory set to the repository (`cwd=repo_path`)
+- Using `--format json` to get structured output instead of the TUI
+- Setting `CI=true` environment variable to disable interactive features
+- Redirecting stdin to prevent interactive prompts
+- Creating a temporary `opencode.json` config file in each repository with all permissions set to `"allow"` to avoid permission prompts
+- Each issue has a 10-minute timeout
+
+This means each task gets its own isolated execution environment where OpenCode operates directly within the repository context, just like a developer would work in that directory.
+
+The JSON events from OpenCode are parsed and stored along with the full output for analysis. The config file is automatically cleaned up after execution.
+
+### Requirements
+
+- OpenCode must be installed and available in your PATH
+- The script will invoke `opencode run --format json` with the problem statement for each issue
