@@ -17,14 +17,116 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Iterator
+
+from rich.console import Console
+from rich.live import Live
+from rich.table import Table
 
 
 DEFAULT_DATASET_PATH = Path("data/raw/test.jsonl")
 DEFAULT_WORKTREE_ROOT = Path("/tmp/bench-english-norwegian")
 DEFAULT_OUTPUT_DIR = Path("results")
+
+
+class EntryStatus:
+    """Track status and metrics for a dataset entry."""
+    
+    def __init__(self, instance_id: str, repo: str):
+        self.instance_id = instance_id
+        self.repo = repo
+        self.status = "pending"  # pending, cloning, running, completed, failed
+        self.tokens_used = 0
+        self.start_time: datetime | None = None
+        self.end_time: datetime | None = None
+        self.error: str | None = None
+        
+    @property
+    def elapsed_time(self) -> str:
+        """Get elapsed time as a formatted string."""
+        if not self.start_time:
+            return "-"
+        end = self.end_time or datetime.now()
+        delta = end - self.start_time
+        minutes, seconds = divmod(int(delta.total_seconds()), 60)
+        if minutes > 0:
+            return f"{minutes}m {seconds}s"
+        return f"{seconds}s"
+    
+    @property
+    def status_icon(self) -> str:
+        """Get status icon for display."""
+        icons = {
+            "pending": "⏳",
+            "cloning": "📥",
+            "running": "🔄",
+            "completed": "✅",
+            "failed": "❌",
+        }
+        return icons.get(self.status, "❓")
+
+
+class ProgressTracker:
+    """Manages progress tracking and TUI display for benchmark runs."""
+    
+    def __init__(self):
+        self.entries: list[EntryStatus] = []
+        self.console = Console()
+        self.lock = threading.Lock()
+        
+    def add_entry(self, instance_id: str, repo: str) -> EntryStatus:
+        """Add a new entry to track."""
+        with self.lock:
+            entry = EntryStatus(instance_id, repo)
+            self.entries.append(entry)
+            return entry
+    
+    def generate_table(self) -> Table:
+        """Generate the Rich table for live display."""
+        table = Table(title="SWE-Bench Progress", show_lines=True)
+        table.add_column("#", style="cyan", width=4)
+        table.add_column("Status", width=8)
+        table.add_column("Instance ID", style="yellow", width=30)
+        table.add_column("Repository", style="blue", width=25)
+        table.add_column("Tokens", style="green", justify="right", width=10)
+        table.add_column("Time", style="magenta", width=10)
+        
+        with self.lock:
+            for idx, entry in enumerate(self.entries, start=1):
+                table.add_row(
+                    str(idx),
+                    f"{entry.status_icon} {entry.status}",
+                    entry.instance_id,
+                    entry.repo.split("/")[-1],  # Show just repo name
+                    str(entry.tokens_used) if entry.tokens_used > 0 else "-",
+                    entry.elapsed_time,
+                )
+                
+            # Add summary row
+            total_tokens = sum(e.tokens_used for e in self.entries)
+            completed = sum(1 for e in self.entries if e.status == "completed")
+            failed = sum(1 for e in self.entries if e.status == "failed")
+            total = len(self.entries)
+            
+            table.add_section()
+            table.add_row(
+                "📊",
+                "SUMMARY",
+                f"Total: {total} | Done: {completed} | Failed: {failed}",
+                "",
+                f"{total_tokens:,}",
+                "",
+                style="bold",
+            )
+        
+        return table
+
+
+tracker = ProgressTracker()
 
 
 def parse_args() -> argparse.Namespace:
@@ -82,13 +184,12 @@ def iter_entries(dataset_path: Path, limit: int | None) -> Iterator[dict]:
             processed += 1
 
 
-def run_git_command(args: list[str], cwd: Path | None = None) -> None:
+def run_git_command(args: list[str], cwd: Path | None = None, quiet: bool = False) -> None:
     cmd = ["git", *args]
     if cwd is not None:
         cmd.insert(1, "-C")
         cmd.insert(2, str(cwd))
-    print(f"$ {' '.join(cmd)}")
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, capture_output=quiet, text=True)
 
 
 def ensure_repository(repo_slug: str, root: Path) -> Path:
@@ -101,23 +202,25 @@ def ensure_repository(repo_slug: str, root: Path) -> Path:
             raise RuntimeError(
                 f"Existing directory {target_dir} is not a git repository."
             )
-        print(f"Reusing existing clone at {target_dir}...")
-        run_git_command(["fetch", "--all", "--tags", "--prune"], cwd=target_dir)
+        run_git_command(["fetch", "--all", "--tags", "--prune"], cwd=target_dir, quiet=True)
     else:
         repo_url = f"https://github.com/{repo_slug}.git"
-        print(f"Cloning {repo_url} into {target_dir}...")
         target_dir.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["git", "clone", repo_url, str(target_dir)], check=True)
+        subprocess.run(
+            ["git", "clone", "--quiet", repo_url, str(target_dir)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
     return target_dir
 
 
 def checkout_commit(repo_path: Path, commit: str) -> None:
-    print(f"Checking out commit {commit} in {repo_path}...")
-    run_git_command(["checkout", "--force", commit], cwd=repo_path)
+    run_git_command(["checkout", "--force", commit], cwd=repo_path, quiet=True)
 
 
-def run_model(model_name: str, entry: dict, repo_path: Path, output_dir: Path) -> dict | None:
+def run_model(model_name: str, entry: dict, repo_path: Path, output_dir: Path, status: EntryStatus, live) -> dict | None:
     """Run the specified model/agent on the repository.
     
     For OpenCode, this invokes the CLI with the problem statement and lets
@@ -128,15 +231,15 @@ def run_model(model_name: str, entry: dict, repo_path: Path, output_dir: Path) -
     instance_id = entry.get("instance_id", "unknown")
     
     if model_name == "opencode":
-        return run_opencode(entry, repo_path, output_dir)
+        return run_opencode(entry, repo_path, output_dir, status, live)
     else:
-        print(
-            f"[TODO] Model '{model_name}' would run on {instance_id} at {repo_path}"
-        )
+        status.status = "failed"
+        status.error = f"Unknown model: {model_name}"
+        status.end_time = datetime.now()
         return None
 
 
-def run_opencode(entry: dict, repo_path: Path, output_dir: Path) -> dict:
+def run_opencode(entry: dict, repo_path: Path, output_dir: Path, status: EntryStatus, live) -> dict:
     """Invoke OpenCode to solve the issue described in the entry.
     
     Returns a result dictionary with success status and metadata.
@@ -153,14 +256,11 @@ def run_opencode(entry: dict, repo_path: Path, output_dir: Path) -> dict:
     }
     
     if not problem_statement:
-        print(f"⚠ No problem statement found for {instance_id}, skipping.")
+        status.status = "failed"
+        status.error = "No problem statement"
+        status.end_time = datetime.now()
         result_data["error"] = "No problem statement"
         return result_data
-    
-    print(f"\n{'='*80}")
-    print(f"Running OpenCode on {instance_id}")
-    print(f"Repository: {repo_path}")
-    print(f"{'='*80}\n")
     
     # Set up OpenCode config in the repository to allow all permissions
     config_file = repo_path / "opencode.json"
@@ -176,9 +276,12 @@ def run_opencode(entry: dict, repo_path: Path, output_dir: Path) -> dict:
     try:
         with config_file.open("w", encoding="utf-8") as f:
             json.dump(config_content, f, indent=2)
-        print(f"✓ Created opencode.json with 'allow' permissions")
     except Exception as e:
-        print(f"⚠ Warning: Could not create opencode.json: {e}")
+        status.status = "failed"
+        status.error = f"Could not create opencode.json: {e}"
+        status.end_time = datetime.now()
+        result_data["error"] = status.error
+        return result_data
     
     # Construct the prompt for OpenCode
     prompt = f"""Please solve the following issue:
@@ -194,86 +297,130 @@ Please:
 3. Run the tests to verify your solution works
 """
     
-    # Invoke OpenCode CLI in non-interactive mode
-    # Run it with cwd set to the repository directory so it operates within that context
-    # Use --format json to get structured output instead of TUI
+    # Invoke OpenCode CLI in non-interactive mode with streaming output
     try:
         # Set environment to disable TTY/interactive mode
         env = os.environ.copy()
         env["CI"] = "true"  # Many tools detect CI mode and disable interactive features
         
-        # Run opencode run with the prompt, executing in the repo directory
-        result = subprocess.run(
-            ["opencode", "run", "--format", "json", prompt],
-            check=False,  # Don't raise on non-zero exit
-            capture_output=True,
-            text=True,
-            timeout=600,  # 10 minute timeout per issue
-            stdin=subprocess.DEVNULL,  # Disable stdin to prevent interactive prompts
-            cwd=str(repo_path),  # Run in the repository directory
-            env=env,
-        )
+        status.status = "running"
+        status.start_time = datetime.now()
+        live.update(tracker.generate_table(), refresh=True)
         
-        result_data["exit_code"] = result.returncode
-        result_data["stdout"] = result.stdout
-        result_data["stderr"] = result.stderr
-        result_data["success"] = result.returncode == 0
+        # Start a background thread to update the display periodically
+        stop_updater = threading.Event()
         
-        print(f"\n{'='*80}")
-        print(f"OpenCode exit code: {result.returncode}")
-        print(f"{'='*80}")
+        def periodic_update():
+            while not stop_updater.is_set():
+                live.update(tracker.generate_table(), refresh=True)
+                time.sleep(0.5)  # Update every 500ms
         
-        # Parse JSON events from stdout if format is json
-        json_events = []
-        if result.stdout:
-            for line in result.stdout.strip().split("\n"):
-                try:
-                    event = json.loads(line)
-                    json_events.append(event)
-                    # Print relevant events
-                    if event.get("type") == "text":
-                        print(event.get("text", ""))
-                    elif event.get("type") == "error":
-                        print(f"Error: {event.get('message', '')}")
-                except json.JSONDecodeError:
-                    # Not JSON, print as-is
-                    print(line)
+        updater_thread = threading.Thread(target=periodic_update, daemon=True)
+        updater_thread.start()
         
-        result_data["json_events"] = json_events
+        try:
+            # Run opencode with Popen to stream output line by line
+            process = subprocess.Popen(
+                ["opencode", "run", "--format", "json", prompt],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,  # Line buffered
+                cwd=str(repo_path),
+                env=env,
+            )
+            
+            stdout_lines = []
+            stderr_lines = []
+            json_events = []
+            
+            # Read stdout line by line as they come in
+            try:
+                if process.stdout:
+                    for line in process.stdout:
+                        line = line.rstrip()
+                        if line:
+                            stdout_lines.append(line)
+                            try:
+                                event = json.loads(line)
+                                json_events.append(event)
+                                
+                                # Track token usage from events in real-time
+                                if event.get("type") == "usage":
+                                    tokens = event.get("totalTokens") or event.get("tokens")
+                                    if tokens:
+                                        status.tokens_used = tokens
+                                elif event.get("type") == "token_usage":
+                                    tokens = event.get("total") or event.get("count")
+                                    if tokens:
+                                        status.tokens_used = tokens
+                            except json.JSONDecodeError:
+                                # Not JSON, skip
+                                pass
+                
+                # Wait for process to complete and get exit code
+                process.wait(timeout=600)
+                
+                # Read any remaining stderr
+                if process.stderr:
+                    stderr_output = process.stderr.read()
+                    if stderr_output:
+                        stderr_lines = stderr_output.strip().split("\n")
+                    
+            except subprocess.TimeoutExpired:
+                process.kill()
+                raise
+            
+            result_data["exit_code"] = process.returncode
+            result_data["stdout"] = "\n".join(stdout_lines)
+            result_data["stderr"] = "\n".join(stderr_lines) if stderr_lines else ""
+            result_data["success"] = process.returncode == 0
+            result_data["json_events"] = json_events
+            result_data["tokens_used"] = status.tokens_used
+            
+            status.status = "completed" if process.returncode == 0 else "failed"
+            status.end_time = datetime.now()
+            
+            if not result_data["success"]:
+                status.error = "Non-zero exit code"
         
-        if result.stderr:
-            print("\nSTDERR:")
-            print(result.stderr)
+        finally:
+            # Stop the background updater thread
+            stop_updater.set()
+            updater_thread.join(timeout=1)
             
     except FileNotFoundError:
         error_msg = "OpenCode CLI not found in PATH"
-        print(f"❌ {error_msg}")
-        print("   You may need to install it first.")
+        status.status = "failed"
+        status.error = error_msg
+        status.end_time = datetime.now()
         result_data["error"] = error_msg
     except subprocess.TimeoutExpired:
         error_msg = "OpenCode timed out after 10 minutes"
-        print(f"⏱ {error_msg}")
+        status.status = "failed"
+        status.error = error_msg
+        status.end_time = datetime.now()
         result_data["error"] = error_msg
     except Exception as e:
         error_msg = f"Error running OpenCode: {e}"
-        print(f"❌ {error_msg}")
+        status.status = "failed"
+        status.error = error_msg
+        status.end_time = datetime.now()
         result_data["error"] = error_msg
     finally:
         # Clean up the config file
         try:
             if config_file.exists():
                 config_file.unlink()
-                print("✓ Cleaned up opencode.json")
-        except Exception as e:
-            print(f"⚠ Warning: Could not remove opencode.json: {e}")
+        except Exception:
+            pass
     
     # Save individual result
     output_dir.mkdir(parents=True, exist_ok=True)
     result_file = output_dir / f"{instance_id}.json"
     with result_file.open("w", encoding="utf-8") as f:
         json.dump(result_data, f, indent=2)
-    
-    print(f"\n✓ Result saved to {result_file}")
     
     return result_data
 
@@ -284,17 +431,49 @@ def process_entries(
     """Process each entry by checking out the repo and running the model."""
     results = []
     
-    for idx, entry in enumerate(entries, start=1):
-        repo = entry["repo"]
-        commit = entry["base_commit"]
-        print(f"\n=== Entry {idx}: {entry['instance_id']} ({repo}@{commit}) ===")
-        repo_path = ensure_repository(repo, workdir_root)
-        checkout_commit(repo_path, commit)
-        result = run_model(model_name, entry, repo_path, output_dir)
-        if result:
-            results.append(result)
+    # Convert entries to list to get count and pre-register them
+    entry_list = list(entries)
     
-    # Save summary of all results
+    # Pre-register all entries in the tracker
+    for entry in entry_list:
+        tracker.add_entry(entry["instance_id"], entry["repo"])
+    
+    # Start the live display with auto-refresh disabled (we'll update manually)
+    with Live(tracker.generate_table(), refresh_per_second=4, console=tracker.console, auto_refresh=True) as live:
+        # Update the renderable to use a callable that regenerates the table
+        live.update(tracker.generate_table(), refresh=True)
+        
+        for idx, entry in enumerate(entry_list):
+            status = tracker.entries[idx]
+            repo = entry["repo"]
+            commit = entry["base_commit"]
+            
+            try:
+                # Update status to cloning
+                status.status = "cloning"
+                live.update(tracker.generate_table(), refresh=True)
+                
+                repo_path = ensure_repository(repo, workdir_root)
+                checkout_commit(repo_path, commit)
+                
+                # Update live display before running model
+                live.update(tracker.generate_table(), refresh=True)
+                
+                # Run the model (this will update status internally)
+                result = run_model(model_name, entry, repo_path, output_dir, status, live)
+                if result:
+                    results.append(result)
+                    
+                # Update display after completion
+                live.update(tracker.generate_table(), refresh=True)
+                
+            except Exception as e:
+                status.status = "failed"
+                status.error = str(e)
+                status.end_time = datetime.now()
+                live.update(tracker.generate_table(), refresh=True)
+    
+    # Save summary of all results after TUI closes
     if results:
         summary_file = output_dir / "summary.json"
         with summary_file.open("w", encoding="utf-8") as f:
@@ -303,14 +482,17 @@ def process_entries(
                     "total": len(results),
                     "successful": sum(1 for r in results if r.get("success")),
                     "failed": sum(1 for r in results if not r.get("success")),
+                    "total_tokens": sum(r.get("tokens_used", 0) for r in results),
                     "results": results,
                 },
                 f,
                 indent=2,
             )
+        
         print(f"\n{'='*80}")
         print(f"Summary saved to {summary_file}")
         print(f"Total: {len(results)}, Successful: {sum(1 for r in results if r.get('success'))}")
+        print(f"Total tokens used: {sum(r.get('tokens_used', 0) for r in results):,}")
         print(f"{'='*80}")
 
 

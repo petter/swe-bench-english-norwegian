@@ -23,7 +23,7 @@ You can override the dataset identifier, split, revision, or output path via com
 
 ## Running the benchmark with OpenCode
 
-The benchmark script now supports running OpenCode as an agent to solve SWE-bench issues:
+The benchmark script now supports running OpenCode as an agent to solve SWE-bench issues with a live progress TUI:
 
 ```bash
 python scripts/run_benchmark.py --dataset data/raw/test.jsonl --limit 5
@@ -33,7 +33,18 @@ This will:
 1. Clone the necessary repositories to `/tmp/bench-english-norwegian`
 2. Check out the appropriate commit for each issue
 3. Invoke OpenCode in non-interactive mode with `--format json` to solve the issue
-4. Save results to the `results/` directory
+4. Display a live TUI showing progress, token usage, and timing for each entry
+5. Save results to the `results/` directory
+
+### Live Progress TUI
+
+The script displays a real-time terminal UI that shows:
+- Status of each dataset entry (pending, cloning, running, completed, failed)
+- Token usage for each OpenCode session
+- Elapsed time for each entry
+- Summary statistics (total entries, completed, failed, total tokens)
+
+The TUI updates live as OpenCode processes each entry, so you can track progress in real-time.
 
 ### Options
 
@@ -58,10 +69,11 @@ The script runs OpenCode in non-interactive mode for each task by:
 - Redirecting stdin to prevent interactive prompts
 - Creating a temporary `opencode.json` config file in each repository with all permissions set to `"allow"` to avoid permission prompts
 - Each issue has a 10-minute timeout
+- Parsing JSON events from OpenCode to track token usage in real-time
 
 This means each task gets its own isolated execution environment where OpenCode operates directly within the repository context, just like a developer would work in that directory.
 
-The JSON events from OpenCode are parsed and stored along with the full output for analysis. The config file is automatically cleaned up after execution.
+The JSON events from OpenCode are parsed and stored along with the full output for analysis. Token usage is extracted from `usage` or `token_usage` events in the JSON stream. The config file is automatically cleaned up after execution.
 
 ### Requirements
 
